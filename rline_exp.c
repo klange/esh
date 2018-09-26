@@ -1406,6 +1406,7 @@ static int read_line(void) {
 
 	while ((cin = getc(stdin))) {
 		get_size();
+		if (cin == -1) continue;
 		if (!decode(&istate, &c, cin)) {
 			if (timeout == 0) {
 				if (c != '\t') tabbed = 0;
