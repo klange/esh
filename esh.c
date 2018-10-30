@@ -75,6 +75,28 @@ int my_pgid;
 
 int is_subshell = 0;
 
+struct semaphore {
+	int fds[2];
+};
+
+struct semaphore create_semaphore(void) {
+	struct semaphore out;
+	pipe(&out.fds);
+	return out;
+}
+
+void raise_semaphore(struct semaphore s){
+	close(s.fds[0]);
+	close(s.fds[1]);
+}
+
+void wait_semaphore(struct semaphore s) {
+	close(s.fds[1]);
+	char buf;
+	read(s.fds[0], &buf, 1);
+	close(s.fds[0]);
+}
+
 void set_pgid(int pgid) {
 	if (shell_interactive == 1) {
 		setpgid(0, pgid);
@@ -787,7 +809,7 @@ int wait_for_child(int pgid, char * name) {
 	int e;
 
 	do {
-		outpid = wait4(waitee, &ret_code, WSTOPPED, NULL);
+		outpid = waitpid(waitee, &ret_code, WSTOPPED);
 		e = errno;
 		if (WIFSTOPPED(ret_code)) {
 			suspended_pgid = pgid;
@@ -1248,10 +1270,12 @@ _nope:
 		int last_output[2];
 		pipe(last_output);
 
+		struct semaphore s = create_semaphore();
 		child_pid = fork();
 		if (!child_pid) {
 			set_pgid(0);
-			set_pgrp(getpid());
+			if (!nowait) set_pgrp(getpid());
+			raise_semaphore(s);
 			is_subshell = 1;
 			dup2(last_output[1], STDOUT_FILENO);
 			close(last_output[0]);
@@ -1298,20 +1322,20 @@ _nope:
 		close(last_output[0]);
 		close(last_output[1]);
 
+		wait_semaphore(s);
+
 		/* Now execute the last piece and wait on all of them */
 	} else {
 		shell_command_t func = shell_find(*arg_starts[0]);
 		if (func) {
 			return func(argcs[0], arg_starts[0]);
 		} else {
-			int signal_pipe[2];
-			pipe(signal_pipe);
+			struct semaphore s = create_semaphore();
 			child_pid = fork();
 			if (!child_pid) {
 				set_pgid(0);
-				set_pgrp(getpid());
-				close(signal_pipe[0]);
-				close(signal_pipe[1]);
+				if (!nowait) set_pgrp(getpid());
+				raise_semaphore(s);
 				is_subshell = 1;
 				if (output_files[cmdi]) {
 					int fd = open(output_files[cmdi], file_args[cmdi], 0666);
@@ -1324,9 +1348,9 @@ _nope:
 				}
 				run_cmd(arg_starts[0]);
 			}
-			close(signal_pipe[1]);
-			char buf;
-			read(signal_pipe[0], &buf, 1);
+
+			wait_semaphore(s);
+
 			pgid = child_pid;
 			last_child = child_pid;
 		}
@@ -1545,7 +1569,7 @@ int main(int argc, char ** argv) {
 		foreach(node, keys) {
 			int pid = (int)node->value;
 			int status = 0;
-			if (waitpid(-pid, &status, WNOHANG | WEXITED) > 0) {
+			if (waitpid(-pid, &status, WNOHANG) > 0) {
 				char * desc = "Done";
 				if (WTERMSIG(status) != 0) {
 					desc = _strsignal(WTERMSIG(status));
