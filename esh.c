@@ -35,16 +35,13 @@
 #include <sys/stat.h>
 
 #include <toaru/list.h>
+#include <toaru/hashmap.h>
 #include <toaru/kbd.h>
 #include <toaru/rline.h>
 #include <toaru/rline_exp.h>
 
 #ifndef environ
 extern char **environ;
-#endif
-
-#ifndef toaru
-#define tcsetpgrp(a,b)
 #endif
 
 #define PIPE_TOKEN "\xFF\xFFPIPE\xFF\xFF"
@@ -70,8 +67,31 @@ char ** shell_argv = NULL;
 int shell_argc = 0;
 int experimental_rline = 1;
 
+static int current_line = 0;
+static char * current_file = NULL;
 
 int pid; /* Process ID of the shell */
+int my_pgid;
+
+int is_subshell = 0;
+
+void set_pgid(int pgid) {
+	if (shell_interactive == 1) {
+		setpgid(0, pgid);
+	}
+}
+
+void set_pgrp(int pgid) {
+	if (shell_interactive == 1 && !is_subshell) {
+		tcsetpgrp(STDIN_FILENO, pgid);
+	}
+}
+
+void reset_pgrp() {
+	if (shell_interactive == 1 && !is_subshell) {
+		tcsetpgrp(STDIN_FILENO, my_pgid);
+	}
+}
 
 void shell_install_command(char * name, shell_command_t func, char * desc) {
 	if (shell_commands_len == SHELL_COMMANDS) {
@@ -79,7 +99,6 @@ void shell_install_command(char * name, shell_command_t func, char * desc) {
 		shell_commands = realloc(shell_commands, sizeof(char *) * SHELL_COMMANDS);
 		shell_pointers = realloc(shell_pointers, sizeof(shell_command_t) * SHELL_COMMANDS);
 		shell_descript = realloc(shell_descript, sizeof(char *) * SHELL_COMMANDS);
-		return;
 	}
 	shell_commands[shell_commands_len] = name;
 	shell_pointers[shell_commands_len] = func;
@@ -306,13 +325,11 @@ void draw_prompt(void) {
 }
 
 volatile int break_while = 0;
-uint32_t child = 0;
+pid_t suspended_pgid = 0;
+hashmap_t * job_hash = NULL;
 
 void sig_pass(int sig) {
 	/* Interrupt handler */
-	if (child) {
-		kill(child, sig);
-	}
 	break_while = sig;
 }
 
@@ -384,6 +401,7 @@ void tab_complete_func(rline_context_t * c) {
 #define COMPLETE_CUSTOM  3
 #define COMPLETE_VARIABLE 4
 	int complete_mode = COMPLETE_FILE;
+	int with_dollar = 0;
 
 	int command_adj = 0;
 	int cursor_adj = cursor;
@@ -403,10 +421,14 @@ void tab_complete_func(rline_context_t * c) {
 		complete_mode = COMPLETE_CUSTOM;
 	}
 
+	if (cursor_adj >= 1 && !strcmp(argv[command_adj], "unset")) {
+		complete_mode = COMPLETE_VARIABLE;
+	}
 
 	/* complete variable names */
 	if (*prefix == '$') {
 		complete_mode = COMPLETE_VARIABLE;
+		with_dollar = 1;
 	}
 
 	if (complete_mode == COMPLETE_COMMAND) {
@@ -502,9 +524,9 @@ void tab_complete_func(rline_context_t * c) {
 			char * tmp = strdup(*envvar);
 			char * c = strchr(tmp, '=');
 			*c = '\0';
-			if (strstr(tmp, prefix+1) == tmp) {
-				char * m = malloc(strlen(tmp)+2);
-				sprintf(m, "$%s", tmp);
+			if (strstr(tmp, prefix+with_dollar) == tmp) {
+				char * m = malloc(strlen(tmp)+1+with_dollar);
+				sprintf(m, "%s%s", with_dollar ? "$" : "", tmp);
 				list_insert(matches, m);
 				match = m;
 			}
@@ -546,7 +568,7 @@ void tab_complete_func(rline_context_t * c) {
 			}
 		} else {
 			/* Print matches */
-			fprintf(stderr,"\033[0m\n");
+			fprintf(stderr,"\n\033[0m");
 			size_t j = 0;
 			foreach(node, matches) {
 				char * match = (char *)node->value;
@@ -629,8 +651,43 @@ int variable_char(uint8_t c) {
 	if (c >= '0' && c <= '9')  return 1;
 	if (c == '_') return 1;
 	if (c == '?') return 1;
+	if (c == '$') return 1;
 	return 0;
 }
+
+struct alternative {
+	const char * command;
+	const char * replacement;
+	const char * description;
+};
+
+#define ALT_BIM    "bim", "vi-like text editor"
+#define ALT_FETCH  "fetch", "URL downloader"
+#define ALT_NETIF  "cat /proc/netif", "to see network configuration"
+
+static struct alternative cmd_alternatives[] = {
+	/* Propose bim as an alternative for common text editors */
+	{"vim",   ALT_BIM},
+	{"vi",    ALT_BIM},
+	{"emacs", ALT_BIM},
+	{"nano",  ALT_BIM},
+
+	/* Propose fetch for some common URL-getting tools */
+	{"curl",  ALT_FETCH},
+	{"wget",  ALT_FETCH},
+
+	/* We don't have ip or ifconfig commands, suggest cat /proc/netif */
+	{"ifconfig", ALT_NETIF},
+	{"ipconfig", ALT_NETIF},
+	{"ip", ALT_NETIF},
+
+	/* Some random other stuff */
+	{"grep", "fgrep", "non-regex-capable grep"},
+	{"more", "bim -", "paging to a text editor"},
+	{"less", "bim -", "paging to a text editor"},
+
+	{NULL, NULL, NULL},
+};
 
 void run_cmd(char ** args) {
 	int i = execvp(*args, args);
@@ -644,6 +701,14 @@ void run_cmd(char ** args) {
 	} else {
 		if (i != 0) {
 			fprintf(stderr, "%s: Command not found\n", *args);
+			for (struct alternative * alt = cmd_alternatives; alt->command; alt++) {
+				if (!strcmp(*args, alt->command)) {
+					fprintf(stderr, "Consider this alternative:\n\n\t%s -- \033[3m%s\033[0m\n\n",
+						alt->replacement,
+						alt->description);
+					break;
+				}
+			}
 			i = 127;
 		}
 	}
@@ -656,6 +721,89 @@ int is_number(const char * c) {
 		c++;
 	}
 	return 1;
+}
+
+static char * _strsignal(int sig) {
+	static char str[256];
+	memset(str, 0, sizeof(str));
+	switch (sig) {
+		case SIGILL:
+			sprintf(str, "Illegal instruction");
+			break;
+		case SIGSEGV:
+			sprintf(str, "Segmentation fault");
+			break;
+		case SIGTERM:
+			sprintf(str, "Terminated");
+			break;
+		case SIGQUIT:
+			sprintf(str, "Quit");
+			break;
+		case SIGKILL:
+			sprintf(str, "Killed");
+			break;
+		case SIGHUP:
+			sprintf(str, "Hangup");
+			break;
+		case SIGUSR1:
+			sprintf(str, "User defined signal 1");
+			break;
+		case SIGUSR2:
+			sprintf(str, "User defined signal 2");
+			break;
+		case SIGINT:
+			sprintf(str, "Interrupt");
+			break;
+		case SIGPIPE:
+			sprintf(str, "Broken pipe");
+			break;
+		default:
+			sprintf(str, "Killed by unhandled signal %d",sig);
+			break;
+	}
+	return str;
+}
+
+/**
+ * Prints "Segmentation fault", etc.
+ */
+static void handle_status(int ret_code) {
+	if (WIFSIGNALED(ret_code)) {
+		int sig = WTERMSIG(ret_code);
+		if (sig == SIGINT || sig == SIGPIPE) return;
+		char * str = _strsignal(sig);
+		if (shell_interactive == 1) {
+			fprintf(stderr, "%s\n", str);
+		} else if (shell_interactive == 2) {
+			fprintf(stderr, "%s: line %d: %s\n", current_file, current_line, str);
+		}
+	}
+}
+
+int wait_for_child(int pgid, char * name) {
+	int waitee = (shell_interactive == 1 && !is_subshell) ? -pgid : pgid;
+	int outpid;
+	int ret_code = 0;
+	int e;
+
+	do {
+		outpid = wait4(waitee, &ret_code, WSTOPPED, NULL);
+		e = errno;
+		if (WIFSTOPPED(ret_code)) {
+			suspended_pgid = pgid;
+			if (name) {
+				hashmap_set(job_hash, (void*)pgid, strdup(name));
+			}
+			fprintf(stderr, "[%d] Stopped\t\t%s\n", pgid, (char*)hashmap_get(job_hash, (void*)pgid));
+			break;
+		} else {
+			suspended_pgid = 0;
+			hashmap_remove(job_hash, (void*)pgid);
+		}
+	} while (outpid != -1 || (outpid == -1 && e != ECHILD));
+	reset_pgrp();
+	handle_status(ret_code);
+	return WEXITSTATUS(ret_code);
 }
 
 int shell_exec(char * buffer, size_t size, FILE * file, char ** out_buffer) {
@@ -680,6 +828,7 @@ int shell_exec(char * buffer, size_t size, FILE * file, char ** out_buffer) {
 	char backtick = 0;
 	char buffer_[512] = {0};
 	int collected = 0;
+	int force_collected = 0;
 
 	list_t * args = list_create();
 	int have_star = 0;
@@ -729,6 +878,9 @@ int shell_exec(char * buffer, size_t size, FILE * file, char ** out_buffer) {
 						if (!strcmp(var, "?")) {
 							sprintf(tmp,"%d",last_ret);
 							c = tmp;
+						} else if (!strcmp(var, "$")) {
+							sprintf(tmp,"%d",getpid());
+							c = tmp;
 						} else if (is_number(var)) {
 							int a = atoi(var);
 							if (a >= 0 && a < shell_argc) {
@@ -743,12 +895,13 @@ int shell_exec(char * buffer, size_t size, FILE * file, char ** out_buffer) {
 							for (int i = 0; i < (int)strlen(c); ++i) {
 								if (c[i] == ' ' && !quoted) {
 									/* If we are not quoted and we reach a space, it signals a new argument */
-									if (collected) {
+									if (collected || force_collected) {
 										buffer_[collected] = '\0';
 										add_argument(args, buffer_);
 										buffer_[0] = '\0';
 										have_star = 0;
 										collected = 0;
+										force_collected = 0;
 									}
 								} else {
 									buffer_[collected] = c[i];
@@ -759,7 +912,28 @@ int shell_exec(char * buffer, size_t size, FILE * file, char ** out_buffer) {
 						}
 						continue;
 					}
+				case '~':
+					if (quoted || collected || backtick) {
+						goto _just_add;
+					} else {
+						if (p[1] == 0 || p[1] == '/' || p[1] == '\n' || p[1] == ' ') {
+							char * c = getenv("HOME");
+							if (!c) {
+								goto _just_add;
+							}
+							for (int i = 0; i < (int)strlen(c); ++i) {
+								buffer_[collected] = c[i];
+								collected++;
+							}
+							buffer_[collected] = '\0';
+							goto _next;
+						} else {
+							goto _just_add;
+						}
+					}
+					break;
 				case '\"':
+					force_collected = 1;
 					if (quoted == '\"') {
 						if (backtick) {
 							goto _just_add;
@@ -775,6 +949,7 @@ int shell_exec(char * buffer, size_t size, FILE * file, char ** out_buffer) {
 					}
 					goto _just_add;
 				case '\'':
+					force_collected = 1;
 					if (quoted == '\'') {
 						if (backtick) {
 							goto _just_add;
@@ -826,18 +1001,20 @@ int shell_exec(char * buffer, size_t size, FILE * file, char ** out_buffer) {
 					goto _just_add;
 				case '|':
 					if (!quoted && !backtick) {
-						if (collected) {
+						if (collected || force_collected) {
 							add_argument(args, buffer_);
 						}
+						force_collected = 0;
 						collected = sprintf(buffer_, "%s", PIPE_TOKEN);
 						goto _new_arg;
 					}
 					goto _just_add;
 				case '>':
 					if (!quoted && !backtick) {
-						if (collected) {
+						if (collected || force_collected) {
 							add_argument(args, buffer_);
 						}
+						force_collected = 0;
 						collected = sprintf(buffer_, "%s", WRITE_TOKEN);
 						goto _new_arg;
 					}
@@ -868,11 +1045,12 @@ _just_add:
 
 _new_arg:
 			backtick = 0;
-			if (collected) {
+			if (collected || force_collected) {
 				add_argument(args, buffer_);
 				buffer_[0] = '\0';
 				have_star = 0;
 				collected = 0;
+				force_collected = 0;
 			}
 
 _next:
@@ -896,7 +1074,7 @@ _done:
 			}
 		}
 
-		if (collected) {
+		if (collected || force_collected) {
 			add_argument(args, buffer_);
 			break;
 		}
@@ -951,51 +1129,82 @@ _done:
 
 			char * before = c;
 			char * after = &glob[8];
+			char * dir = NULL;
 
 			int has_before = !!strlen(before);
 			int has_after = !!strlen(after);
 
-			if (!has_before || !strchr(before,'/')) {
+			if (1) {
 				/* read current directory, add all */
-				DIR * dirp = opendir(".");
+				DIR * dirp;
+				char * prepend = "";
+				if (has_before) {
+					dir = strrchr(before,'/');
+
+					if (!dir) {
+						dirp = opendir(".");
+					} else if (dir == before) {
+						dirp = opendir("/");
+						prepend = before;
+						before++;
+					} else {
+						*dir = '\0';
+						dirp = opendir(before);
+						prepend = before;
+						before = dir+1;
+					}
+				} else {
+					dirp = opendir(".");
+				}
 
 				int before_i = i;
-				struct dirent * ent = readdir(dirp);
-				while (ent != NULL) {
-					if (ent->d_name[0] != '.') {
-						char * s = malloc(sizeof(char) * (strlen(ent->d_name) + 1));
-						memcpy(s, ent->d_name, strlen(ent->d_name) + 1);
+				if (dirp) {
+					struct dirent * ent = readdir(dirp);
+					while (ent != NULL) {
+						if (ent->d_name[0] != '.') {
+							char * s = malloc(sizeof(char) * (strlen(ent->d_name) + 1));
+							memcpy(s, ent->d_name, strlen(ent->d_name) + 1);
 
-						char * t = s;
+							char * t = s;
 
-						if (has_before) {
-							if (strstr(s,before) != s) {
-								goto _nope;
-							}
-							t = &s[strlen(before)];
-						}
-						if (has_after) {
-							if (strlen(t) >= strlen(after)) {
-								if (!strcmp(after,&t[strlen(t)-strlen(after)])) {
-									argv[i] = s;
-									i++;
-									argcs[cmdi]++;
+							if (has_before) {
+								if (strstr(s,before) != s) {
+									free(s);
+									goto _nope;
 								}
+								t = &s[strlen(before)];
 							}
-						} else {
-							argv[i] = s;
-							i++;
-							argcs[cmdi]++;
+							if (has_after) {
+								if (strlen(t) >= strlen(after)) {
+									if (!strcmp(after,&t[strlen(t)-strlen(after)])) {
+										char * out = malloc(strlen(s) + 2 + strlen(prepend));
+										sprintf(out,"%s%s%s", prepend, !!*prepend ? "/" : "", s);
+										argv[i] = out;
+										i++;
+										argcs[cmdi]++;
+									}
+								}
+							} else {
+								char * out = malloc(strlen(s) + 2 + strlen(prepend));
+								sprintf(out,"%s%s%s", prepend, !!*prepend ? "/" : "", s);
+								argv[i] = out;
+								i++;
+								argcs[cmdi]++;
+							}
+							free(s);
 						}
-					}
 _nope:
-					ent = readdir(dirp);
+						ent = readdir(dirp);
+					}
+					closedir(dirp);
 				}
-				closedir(dirp);
 
 				if (before_i == i) {
 					/* no matches */
 					glob[0] = '*';
+					if (dir) {
+						*dir = '/';
+					}
 					memmove(&glob[1], after, strlen(after)+1);
 					argv[i] = c;
 					i++;
@@ -1003,12 +1212,6 @@ _nope:
 				} else {
 					free(c);
 				}
-			} else {
-				/* directory globs not supported */
-				glob[0] = '*';
-				argv[i] = c;
-				i++;
-				argcs[cmdi]++;
 			}
 		} else {
 			argv[i] = c;
@@ -1033,26 +1236,36 @@ _nope:
 	tokenid = i;
 
 	unsigned int child_pid;
+	int last_child;
 
 	int nowait = (!strcmp(argv[tokenid-1],"&"));
 	if (nowait) {
 		argv[tokenid-1] = NULL;
 	}
 
+	int pgid = 0;
 	if (cmdi > 0) {
 		int last_output[2];
 		pipe(last_output);
+
 		child_pid = fork();
 		if (!child_pid) {
+			set_pgid(0);
+			set_pgrp(getpid());
+			is_subshell = 1;
 			dup2(last_output[1], STDOUT_FILENO);
 			close(last_output[0]);
 			run_cmd(arg_starts[0]);
 		}
 
+		pgid = child_pid;
+
 		for (int j = 1; j < cmdi; ++j) {
 			int tmp_out[2];
 			pipe(tmp_out);
 			if (!fork()) {
+				is_subshell = 1;
+				set_pgid(pgid);
 				dup2(tmp_out[1], STDOUT_FILENO);
 				dup2(last_output[0], STDIN_FILENO);
 				close(tmp_out[0]);
@@ -1065,7 +1278,10 @@ _nope:
 			last_output[1] = tmp_out[1];
 		}
 
-		if (!fork()) {
+		last_child = fork();
+		if (!last_child) {
+			is_subshell = 1;
+			set_pgid(pgid);
 			if (output_files[cmdi]) {
 				int fd = open(output_files[cmdi], file_args[cmdi], 0666);
 				if (fd < 0) {
@@ -1088,8 +1304,15 @@ _nope:
 		if (func) {
 			return func(argcs[0], arg_starts[0]);
 		} else {
+			int signal_pipe[2];
+			pipe(signal_pipe);
 			child_pid = fork();
 			if (!child_pid) {
+				set_pgid(0);
+				set_pgrp(getpid());
+				close(signal_pipe[0]);
+				close(signal_pipe[1]);
+				is_subshell = 1;
 				if (output_files[cmdi]) {
 					int fd = open(output_files[cmdi], file_args[cmdi], 0666);
 					if (fd < 0) {
@@ -1101,23 +1324,29 @@ _nope:
 				}
 				run_cmd(arg_starts[0]);
 			}
+			close(signal_pipe[1]);
+			char buf;
+			read(signal_pipe[0], &buf, 1);
+			pgid = child_pid;
+			last_child = child_pid;
 		}
 	}
 
-	tcsetpgrp(STDIN_FILENO, child_pid);
-	int ret_code = 0;
-	if (!nowait) {
-		child = child_pid;
-		int pid;
-		do {
-			pid = waitpid(-1, &ret_code, 0);
-		} while (pid != -1 || (pid == -1 && errno != ECHILD));
-		child = 0;
+	if (nowait) {
+		if (shell_interactive == 1) {
+			fprintf(stderr, "[%d] %s\n", pgid, arg_starts[0][0]);
+			hashmap_set(job_hash, (void*)pgid, strdup(arg_starts[0][0]));
+		} else {
+			hashmap_set(job_hash, (void*)last_child, strdup(arg_starts[0][0]));
+		}
+		free(cmd);
+		return 0;
 	}
-	tcsetpgrp(STDIN_FILENO, getpid());
-	free(cmd);
 
-	return ret_code;
+
+	int ret = wait_for_child(shell_interactive == 1 ? pgid : last_child, arg_starts[0][0]);
+	free(cmd);
+	return ret;
 }
 
 void add_path_contents(char * path) {
@@ -1207,6 +1436,7 @@ void add_path(void) {
 }
 
 int run_script(FILE * f) {
+	current_line = 1;
 	while (!feof(f)) {
 		char buf[LINE_LEN] = {0};
 		fgets(buf, LINE_LEN, f);
@@ -1217,6 +1447,7 @@ int run_script(FILE * f) {
 			ret = shell_exec(b, LINE_LEN, f, &out);
 			b = out;
 		} while (b);
+		current_line++;
 		if (ret >= 0) last_ret = ret;
 	}
 
@@ -1236,6 +1467,7 @@ void source_eshrc(void) {
 	FILE * f = fopen(tmp, "r");
 	if (!f) return;
 
+	current_file = tmp;
 	run_script(f);
 }
 
@@ -1246,13 +1478,12 @@ int main(int argc, char ** argv) {
 	signal(SIGINT, sig_pass);
 	signal(SIGWINCH, sig_pass);
 
+	job_hash = hashmap_create_int(10);
+
 	getuser();
 	gethost();
 
 	install_commands();
-	/* Parse $PATH to add contents */
-	add_path();
-	sort_commands();
 
 	if (argc > 1) {
 		int c;
@@ -1291,17 +1522,40 @@ int main(int argc, char ** argv) {
 		}
 
 		shell_argc = argc - 1;
-		shell_argv = &argv[1];
+		shell_argv = &argv[optind];
+		current_file = argv[optind];
 
 		return run_script(f);
 	}
 
 	shell_interactive = 1;
 
+	my_pgid = getpgid(0);
+	signal(SIGTTOU, SIG_IGN);
+	signal(SIGTTIN, SIG_IGN);
+
 	source_eshrc();
+	add_path();
+	sort_commands();
 
 	while (1) {
 		char buffer[LINE_LEN] = {0};
+
+		list_t * keys = hashmap_keys(job_hash);
+		foreach(node, keys) {
+			int pid = (int)node->value;
+			int status = 0;
+			if (waitpid(-pid, &status, WNOHANG | WEXITED) > 0) {
+				char * desc = "Done";
+				if (WTERMSIG(status) != 0) {
+					desc = _strsignal(WTERMSIG(status));
+				}
+				fprintf(stderr, "[%d] %s\t\t%s\n", pid, desc, (char*)hashmap_get(job_hash, (void*)pid));
+				hashmap_remove(job_hash, (void*)pid);
+			}
+		}
+		list_free(keys);
+		free(keys);
 
 		read_entry(buffer);
 
@@ -1432,20 +1686,20 @@ uint32_t shell_cmd_if(int argc, char * argv[]) {
 
 	pid_t child_pid = fork();
 	if (!child_pid) {
+		set_pgid(0);
+		set_pgrp(getpid());
+		is_subshell = 1;
 		run_cmd(if_args);
 	}
-	tcsetpgrp(STDIN_FILENO, child_pid);
-
-	child = child_pid;
 
 	int pid, ret_code = 0;
 	do {
-		pid = waitpid(-1, &ret_code, 0);
+		pid = waitpid(child_pid, &ret_code, 0);
 	} while (pid != -1 || (pid == -1 && errno != ECHILD));
 
-	child = 0;
+	handle_status(ret_code);
 
-	if (ret_code == 0) {
+	if (WEXITSTATUS(ret_code) == 0) {
 		shell_command_t func = shell_find(*then_args);
 		if (func) {
 			int argc = 0;
@@ -1456,16 +1710,17 @@ uint32_t shell_cmd_if(int argc, char * argv[]) {
 		} else {
 			child_pid = fork();
 			if (!child_pid) {
+				set_pgid(0);
+				set_pgrp(getpid());
+				is_subshell = 1;
 				run_cmd(then_args);
 			}
-			tcsetpgrp(STDIN_FILENO, child_pid);
-			child = child_pid;
 			do {
-				pid = waitpid(-1, &ret_code, 0);
+				pid = waitpid(child_pid, &ret_code, 0);
 			} while (pid != -1 || (pid == -1 && errno != ECHILD));
-			child = 0;
-			tcsetpgrp(STDIN_FILENO, getpid());
-			return ret_code;
+			reset_pgrp();
+			handle_status(ret_code);
+			return WEXITSTATUS(ret_code);
 		}
 	} else if (else_args) {
 		shell_command_t func = shell_find(*else_args);
@@ -1478,19 +1733,20 @@ uint32_t shell_cmd_if(int argc, char * argv[]) {
 		} else {
 			child_pid = fork();
 			if (!child_pid) {
+				set_pgid(0);
+				set_pgrp(getpid());
+				is_subshell = 1;
 				run_cmd(else_args);
 			}
-			tcsetpgrp(STDIN_FILENO, child_pid);
-			child = child_pid;
 			do {
-				pid = waitpid(-1, &ret_code, 0);
+				pid = waitpid(child_pid, &ret_code, 0);
 			} while (pid != -1 || (pid == -1 && errno != ECHILD));
-			child = 0;
-			return ret_code;
+			handle_status(ret_code);
+			return WEXITSTATUS(ret_code);
 		}
 	}
 
-	tcsetpgrp(STDIN_FILENO, getpid());
+	reset_pgrp();
 	return 0;
 }
 
@@ -1511,33 +1767,37 @@ uint32_t shell_cmd_while(int argc, char * argv[]) {
 	}
 
 	break_while = 0;
-	tcsetpgrp(STDIN_FILENO, getpid());
+	reset_pgrp();
 
 	do {
 		pid_t child_pid = fork();
 		if (!child_pid) {
+			set_pgid(0);
+			set_pgrp(getpid());
+			is_subshell = 1;
 			run_cmd(while_args);
 		}
-		child = child_pid;
 
 		int pid, ret_code = 0;
 		do {
-			pid = waitpid(-1, &ret_code, 0);
+			pid = waitpid(child_pid, &ret_code, 0);
 		} while (pid != -1 || (pid == -1 && errno != ECHILD));
-		child = 0;
 
-		if (ret_code == 0) {
+		handle_status(ret_code);
+		if (WEXITSTATUS(ret_code) == 0) {
 			child_pid = fork();
 			if (!child_pid) {
+				set_pgid(0);
+				set_pgrp(getpid());
+				is_subshell = 1;
 				run_cmd(do_args);
 			}
-			child = child_pid;
 			do {
-				pid = waitpid(-1, &ret_code, 0);
+				pid = waitpid(child_pid, &ret_code, 0);
 			} while (pid != -1 || (pid == -1 && errno != ECHILD));
-			child = 0;
 		} else {
-			return ret_code;
+			reset_pgrp();
+			return WEXITSTATUS(ret_code);
 		}
 	} while (!break_while);
 
@@ -1555,6 +1815,9 @@ uint32_t shell_cmd_export_cmd(int argc, char * argv[]) {
 	pipe(pipe_fds);
 	pid_t child_pid = fork();
 	if (!child_pid) {
+		set_pgid(0);
+		set_pgrp(getpid());
+		is_subshell = 1;
 		dup2(pipe_fds[1], STDOUT_FILENO);
 		close(pipe_fds[0]);
 		run_cmd(&argv[2]);
@@ -1562,7 +1825,6 @@ uint32_t shell_cmd_export_cmd(int argc, char * argv[]) {
 
 	close(pipe_fds[1]);
 
-	tcsetpgrp(STDIN_FILENO, child_pid);
 	char buf[1024];
 	size_t accum = 0;
 
@@ -1577,7 +1839,9 @@ uint32_t shell_cmd_export_cmd(int argc, char * argv[]) {
 		accum += r;
 	} while (accum < 1023);
 
-	tcsetpgrp(STDIN_FILENO, getpid());
+	waitpid(child_pid, NULL, 0);
+
+	reset_pgrp();
 
 	buf[accum] = '\0';
 
@@ -1602,7 +1866,7 @@ uint32_t shell_cmd_equals(int argc, char * argv[]) {
 
 	if (argc < 3) return 1;
 
-	return strcmp(argv[1], argv[2]);
+	return !!strcmp(argv[1], argv[2]);
 }
 
 uint32_t shell_cmd_return(int argc, char * argv[]) {
@@ -1618,8 +1882,10 @@ uint32_t shell_cmd_source(int argc, char * argv[]) {
 
 	if (!f) {
 		fprintf(stderr, "%s: %s: %s", argv[0], argv[1], strerror(errno));
+		return 1;
 	}
 
+	current_file = argv[1];
 	return run_script(f);
 }
 
@@ -1636,17 +1902,139 @@ uint32_t shell_cmd_not(int argc, char * argv[]) {
 	int ret_code = 0;
 	pid_t child_pid = fork();
 	if (!child_pid) {
+		set_pgid(0);
+		set_pgrp(getpid());
+		is_subshell = 1;
 		run_cmd(&argv[1]);
 	}
-	tcsetpgrp(STDIN_FILENO, child_pid);
-	child = child_pid;
 	do {
-		pid = waitpid(-1, &ret_code, 0);
+		pid = waitpid(child_pid, &ret_code, 0);
 	} while (pid != -1 || (pid == -1 && errno != ECHILD));
-	child = 0;
-	tcsetpgrp(STDIN_FILENO, getpid());
-	return !ret_code;
+	reset_pgrp();
+	handle_status(ret_code);
+	return !WEXITSTATUS(ret_code);
+}
 
+uint32_t shell_cmd_unset(int argc, char * argv[]) {
+	if (argc < 2) {
+		fprintf(stderr, "%s: expected command argument\n", argv[0]);
+		return 1;
+	}
+
+	return unsetenv(argv[1]);
+}
+
+uint32_t shell_cmd_read(int argc, char * argv[]) {
+	int raw = 0;
+	int i = 1;
+	char * var = "REPLY";
+	if (i < argc && !strcmp(argv[i], "-r")) {
+		raw = 1;
+		i++;
+	}
+	if (i < argc) {
+		var = argv[i];
+	}
+
+	char tmp[4096];
+	fgets(tmp, 4096, stdin);
+
+	if (*tmp && tmp[strlen(tmp)-1] == '\n') {
+		tmp[strlen(tmp)-1] = '\0';
+	}
+
+	if (raw) {
+		setenv(var, tmp, 1);
+		return 0;
+	}
+
+	char tmp2[4096] = {0};
+	char * out = tmp2;
+	char * in = tmp;
+
+	/* TODO: This needs to actually read more if a \ at the end of the line is found */
+	while (*in) {
+		if (*in == '\\') {
+			in++;
+			if (*in == '\n') {
+				in++;
+			}
+		} else {
+			*out = *in;
+			out++;
+			in++;
+		}
+	}
+
+	setenv(var, tmp2, 1);
+	return 0;
+}
+
+int get_available_job(int argc, char * argv[]) {
+	if (argc < 2) {
+		if (!suspended_pgid) {
+			list_t * keys = hashmap_keys(job_hash);
+			foreach(node, keys) {
+				suspended_pgid = (int)node->value;
+				break;
+			}
+			list_free(keys);
+			free(keys);
+			if (!suspended_pgid) {
+				return 0;
+			}
+		}
+		return suspended_pgid;
+	} else {
+		return atoi(argv[1]);
+	}
+}
+
+uint32_t shell_cmd_fg(int argc, char * argv[]) {
+	int pid = get_available_job(argc,argv);
+	if (!pid || !hashmap_has(job_hash, (void*)pid)) {
+		fprintf(stderr, "no current job\n");
+		return 1;
+	}
+
+	set_pgrp(pid);
+
+	if (kill(-pid, SIGCONT) < 0) {
+		fprintf(stderr, "no current job / bad pid\n");
+		hashmap_remove(job_hash, (void*)pid);
+		return 1;
+	}
+
+	return wait_for_child(pid, NULL);
+}
+
+uint32_t shell_cmd_bg(int argc, char * argv[]) {
+	int pid = get_available_job(argc,argv);
+	if (!pid || !hashmap_has(job_hash, (void*)pid)) {
+		fprintf(stderr, "no current job\n");
+		return 1;
+	}
+
+	if (kill(-pid, SIGCONT) < 0) {
+		fprintf(stderr, "no current job / bad pid\n");
+		hashmap_remove(job_hash, (void*)pid);
+		return 1;
+	}
+
+	fprintf(stderr, "[%d] %s\n", pid, (char*)hashmap_get(job_hash, (void*)pid));
+	return 0;
+}
+
+uint32_t shell_cmd_jobs(int argc, char * argv[]) {
+	list_t * keys = hashmap_keys(job_hash);
+	foreach(node, keys) {
+		int pid = (int)node->value;
+		char * c = hashmap_get(job_hash, (void*)pid);
+		fprintf(stdout, "%5d %s\n", pid, c);
+	}
+	list_free(keys);
+	free(keys);
+	return 0;
 }
 
 void install_commands() {
@@ -1668,4 +2056,9 @@ void install_commands() {
 	shell_install_command("source",  shell_cmd_source, "run a shell script in the context of this shell");
 	shell_install_command("exec",    shell_cmd_exec, "replace shell (or subshell) with command");
 	shell_install_command("not",     shell_cmd_not, "invert status of command");
+	shell_install_command("unset",   shell_cmd_unset, "unset variable");
+	shell_install_command("read",    shell_cmd_read, "read user input");
+	shell_install_command("fg",      shell_cmd_fg, "resume a suspended job");
+	shell_install_command("jobs",    shell_cmd_jobs, "list stopped jobs");
+	shell_install_command("bg",      shell_cmd_bg, "restart suspended job in the background");
 }
